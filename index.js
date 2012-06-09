@@ -147,7 +147,7 @@
 	};
 
 	/*
-	 * Here's where the magic happens! validate() takes three arguments:
+	 * Here's where the magic happens! validate() takes two arguments:
 	 *
 	 *   val: any sort of value to be evaluated
 	 *
@@ -187,10 +187,6 @@
 	 *     but imagine having to sniff binary types for images, audio, etc! (6.4)
 	 *
 	 *     mediaType: Not sure what this one is for (6.6)
-	 *
-	 *   partial: a flag that determines whether we should fail on 'required'
-	 *   errors. useful for checking small chunks of a schema. True means we don't
-	 *   create errors for missing required values. Default is false.
 	 */
 
 	/* The actual validate() function is nothing but a closure that allows
