@@ -4,6 +4,9 @@ var is = require('is-helpers');
 	var ValidationError,
 		ErrorContainer;
 
+	/* ValidationError constructor; creates a simple ValidationError object with
+	 * the error level, an error message explaining what went wrong, and the
+	 * title of the current schema, if it has one */
 	exports.ValidationError = ValidationError = function (level, message, title) {
 		if (is.object(level)) {
 			message = level.message;
@@ -17,13 +20,13 @@ var is = require('is-helpers');
 
 	ValidationError.prototype = Error.prototype;
 
-	function toType (obj) {
-		return ({}).toString.call(obj).match(/\s([a-z|A-Z]+)/)[1].toLowerCase();
-	}
-
+	/* ErrorContainer constructor; holds a counter to tally the total number of
+	 * errors (optionally, with error levels if you're using them), plus an
+	 * array of all the ValidationErrors themselves. Takes an optional
+	 * ValidationError object to start the ball rolling. */
 	var ErrorContainer = exports.ErrorContainer = function ErrorContainer (error) {
 		// hey wait! Is this already an error container?
-		if (typeof error === 'object' && error.$counts && error.$messages) {
+		if (typeof error === 'object' && error instanceof ErrorContainer) {
 			return error;
 		}
 		// create the error container
@@ -35,20 +38,20 @@ var is = require('is-helpers');
 		if (!(error instanceof ValidationError)) {
 			error = new ValidationError(null, error);
 		}
-		this.$counts[error.level] = 1;
-		this.$counts.$total = 1;
-		this.$messages.push(error);
+		this.addError(error);
 	};
 
-	// merge two ErrorContainer instances together recursively, updating error
-	// totals for each node as needed
+	/* merge two ErrorContainer instances together recursively, updating error
+	 * totals for each node as needed */
 	ErrorContainer.merge = function (oldCon, newCon) {
 		var i;
 		if (oldCon === undefined) {
 			return newCon;
 		}
 		for (i in newCon.$counts) {
-			countError(oldCon, i, newCon.$counts[i]);
+			if (newCon.$counts.hasOwnProperty(i)) {
+				oldCon.countError(i, newCon.$counts[i]);
+			}
 		}
 		oldCon.$messages = oldCon.$messages.concat(newCon.$messages);
 		for (i in newCon) {
@@ -59,15 +62,88 @@ var is = require('is-helpers');
 			}
 		}
 		return oldCon;
-	}; // end method ErrorContainer.merge
+	};
 
 	// merge an ErrorContainer instance with a passed instance
-	ErrorContainer.prototype.merge = function (conts) {
-		conts = Array.prototype.slice.call(conts, 0);
-		for (var i = 0; i < conts.length; i ++) {
-			ErrorContainer.merge(this, conts[i]);
+	ErrorContainer.prototype.merge = function merge (containers) {
+		containers = Array.prototype.slice.call(containers, 0);
+		for (var i = 0; i < containers.length; i ++) {
+			ErrorContainer.merge(this, containers[i]);
 		}
-	}; // end method Errorcontainer.prototype.merge
+	};
+
+	/* adds a ValidationError or ErrorContainer to an ErrorContainer and
+	 * increments the error counts -- if it's just a single ValidationError,
+	 * it increments by one, and if it's an ErrorContainer, it increments it by
+	 * however many errors are inside that container */
+	ErrorContainer.prototype.addError = function addError (error, property, dependency) {
+		var i, j;
+		// if we got any of these values, that means it's not an error
+		if (error === true || error === undefined || error === null) {
+			return;
+		}
+		/* if the 'property' argument has a value, assume error is actually an
+		 * errorContainer that's come from a sub-validation, add container to
+		 * this[property], aggregate error totals, then finish */
+		if (property) {
+			error = new ErrorContainer(error);
+		}
+		if (error instanceof ErrorContainer && error.$counts) {
+			if (error.$counts.$total) {
+				for (i in error.$counts) {
+					if (error.$counts.hasOwnProperty(i)) {
+						this.countError(i, error.$counts[i]);
+					}
+				}
+				if (property) {
+					if (dependency) {
+						/* if the dependency flag is set, then this container
+						 * was the result of a dependency check; add it to the
+						 * dependencies hash instead of trying to add the
+						 * container to this[property] */
+						if (this.dendencies === undefined) {
+							this.dependencies = {};
+						}
+						this.dependencies[property] = error;
+					} else {
+						/* merge tree of errorContainers together; kinda makes a
+						 * mish-mash cuz it doesn't tell you whether any given
+						 * error comes from oldCon or newCon */
+						if (!this[property]) {
+							this[property] = new ErrorContainer ();
+						}
+						this[property].merge(error);
+					}
+				}
+			}
+			return;
+		}
+		// create a ValidationError for generic this: false or message
+		if (error === false || typeof error === 'string') {
+			error = new ValidationError(undefined, error);
+		}
+		if (!is.array(error)) {
+			error = [error];
+		}
+		// add the error to the list, tally up the number of errLevels
+		for (i = 0; i < error.length; i ++) {
+			this.$messages.push(error[i]);
+			this.countError(error[i].level, 1);
+		}
+	};
+
+	/* initialise the errLevels counter if undefined, then add the amount to the
+	 * counter. if counter starts with a $, then it's a special counter,
+	 * reserved for internal ErrorContainer use. */
+	ErrorContainer.prototype.countError = function countError (counter, amt) {
+		if (amt && (counter.charAt(0) !== '$')) {
+			if (this.$counts[counter] === undefined) {
+				this.$counts[counter] = 0;
+			}
+			this.$counts[counter] += amt;
+			this.$counts.$total += amt;
+		}
+	};
 
 	/*
 	 * Here's where the magic happens! validate() takes three arguments:
@@ -136,74 +212,6 @@ var is = require('is-helpers');
 				allowedProperties = [],
 				funcResult;
 
-			function countError(errors, counter, amt) {
-				// initialise the errLevels counter if undefined, then add the
-				// amount to the counter
-				// if counter starts with a $, then it's a special counter
-				if (amt && (counter.charAt(0) !== '$')) {
-					if (errors.$counts[counter] === undefined) {
-						errors.$counts[counter] = 0;
-					}
-					errors.$counts[counter] += amt;
-					errors.$counts.$total += amt;
-				}
-			}
-
-			function addError(error, property, dependency) {
-				var i, j;
-
-				// if we got any of these values, that means it's not an error
-				if (error === true || error === undefined || error === null) {
-					return;
-				}
-				// if the 'property' argument has a value, assume error is actually an
-				// errorContainer that's come from a sub-validation, add container to
-				// errors[property], aggregate error totals, then finish
-				if (property) {
-					error = new ErrorContainer(error);
-				}
-				if (typeof error === 'object' && error.$counts) {
-					if (error.$counts.$total) {
-						for (i in error.$counts) {
-							countError(errors, i, error.$counts[i]);
-						}
-						if (property) {
-							if (dependency) {
-								// if the dependency flag is set, then this container was the
-								// result of a dependency check; add it to the dependencies
-								// has instead of trying to add the container to
-								// errors[property]
-								if (errors.dendencies === undefined) {
-									errors.dependencies = {};
-								}
-								errors.dependencies[property] = error;
-							} else {
-								// merge tree of errorContainers together; kinda makes a mish-
-								// mash cuz it doesn't tell you whether any given error comes
-								// from oldCon or newCon
-								if (!errors[property]) {
-									errors[property] = new ErrorContainer ();
-								}
-								errors[property].merge(error);
-							}
-						}
-					}
-					return;
-				}
-				// create a ValidationError for generic errors: false or message
-				if (error === false || typeof error === 'string') {
-					error = new ValidationError(undefined, error);
-				}
-				if (!is.array(error)) {
-					error = [error];
-				}
-				// add the error to the list, tally up the number of errLevels
-				for (i = 0; i < error.length; i ++) {
-					errors.$messages.push(error[i]);
-					countError(errors, error[i].level, 1);
-				}
-			}
-
 			// prepare message for appending to specific failure messages
 			message = schema.message ? ', '+schema.message : '';
 
@@ -213,7 +221,7 @@ var is = require('is-helpers');
 			// is not set.
 			if (obj === undefined) {
 				if (schema.required && !partial) {
-					addError(new ValidationError(schema.errLevel, 'Required value is undefined'+message, schema.title));
+					errors.addError(new ValidationError(schema.errLevel, 'Required value is undefined'+message, schema.title));
 				}
 				return errors;
 			}
@@ -260,9 +268,9 @@ var is = require('is-helpers');
 					allowedTypes = (typeof schema.type === 'string') ? [schema.type] : schema.type;
 				}
 				tempType = type === 'integer' ? 'number' : type;
-				if (allowedTypes.indexOf(tempType) === -1 && allowedTypes.indexOf(type) === -1) {
+				if (!is.in(tempType, allowedTypes) && !is.in(type, allowedTypes)) {
 					disallowedType = true;
-					addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed types'+message, schema.title));
+					errors.addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed types'+message, schema.title));
 				}
 
 			}
@@ -275,10 +283,10 @@ var is = require('is-helpers');
 			// but that doesn't make sense for 'any'.
 			if (schema.disallowed && schema.disallowed !== 'any') {
 				tempType = type === 'integer' ? 'number' : type;
-				disallowedTypes = (typeof schema.disallowed === 'string') ? [schema.disallowed] : schema.disallowed;
-				if (disallowedTypes.indexOf(tempType) !== -1 || disallowedTypes.indexOf(type) !== -1) {
+				disallowedTypes = (is.array(schema.disallowed) ? schema.disallowed : [schema.disallowed]);
+				if (is.in(tempType, disallowedTypes) || is.in(type, disallowedTypes)) {
 					disallowedType = true;
-					addError(new ValidationError(schema.errLevel, 'Object is one of the disallowed types'+message, schema.title));
+					errors.addError(new ValidationError(schema.errLevel, 'Object is one of the disallowed types'+message, schema.title));
 				}
 			}
 
@@ -299,18 +307,19 @@ var is = require('is-helpers');
 					 * 	 those formats are at the top of this module)
 					 */
 					case 'string':
+						//errors.merge(validateString(obj, schema));
 						if (schema.minLength && obj.length < schema.minLength) {
-							addError(new ValidationError(schema.errLevel, 'String is too small'+message, schema.title));
+							errors.addError(new ValidationError(schema.errLevel, 'String is too small'+message, schema.title));
 						}
 						if (schema.maxLength && obj.length > schema.maxLength) {
-							addError(new ValidationError(schema.errLevel, 'String is too large'+message, schema.title));
+							errors.addError(new ValidationError(schema.errLevel, 'String is too large'+message, schema.title));
 						}
 						if (schema.pattern) {
 							pattern = typeof schema.pattern === 'string'
 								? new RegExp(schema.pattern)
 								: schema.pattern;
 							if (!pattern.test(obj)) {
-								addError(new ValidationError(schema.errLevel, 'String does not match pattern'+message, schema.title));
+								errors.addError(new ValidationError(schema.errLevel, 'String does not match pattern'+message, schema.title));
 							}
 						}
 						break;
@@ -334,10 +343,10 @@ var is = require('is-helpers');
 					 */
 					case 'array':
 						if (schema.minItems && obj.length < schema.minItems) {
-							addError(new ValidationError(schema.errLevel, 'Array has too few items'+message, schema.title));
+							errors.addError(new ValidationError(schema.errLevel, 'Array has too few items'+message, schema.title));
 						}
 						if (schema.maxItems && obj.length > schema.maxItems) {
-							addError(new ValidationError(schema.errLevel, 'Array has too many items'+message, schema.title));
+							errors.addError(new ValidationError(schema.errLevel, 'Array has too many items'+message, schema.title));
 						}
 						if (schema.items) {
 							for (j = 0; j < obj.length; j++) {
@@ -354,17 +363,17 @@ var is = require('is-helpers');
 								}
 								// adds the error as an Error Container to a numeric property j,
 								// corresponding to the item's index
-								addError(validate(obj[j], itemSchema), j);
+								errors.addError(validate(obj[j], itemSchema), j);
 							}
 							if (additionalStart) {
 								if (schema.additionalItems) {
 									// start where we left off (additionalStart) and continue with
 									// the schema defined by additionalItems
 									for (j = additionalStart; j < obj.length; j++) {
-										addError(validate(obj[j], schema.additionalItems), j);
+										errors.addError(validate(obj[j], schema.additionalItems), j);
 									}
 								} else {
-									addError(new ValidationError(schema.errLevel, 'Array cannot have additional items'+message, schema.title));
+									errors.addError(new ValidationError(schema.errLevel, 'Array cannot have additional items'+message, schema.title));
 								}
 							}
 						}
@@ -375,7 +384,7 @@ var is = require('is-helpers');
 									key = JSON.stringify(key);
 								}
 								if (is.inArray(key, uniqueItems)) {
-									addError(new ValidationError(schema.errLevel, 'This array item is a duplicate'+message, schema.title), j);
+									errors.addError(new ValidationError(schema.errLevel, 'This array item is a duplicate'+message, schema.title), j);
 								} else {
 									uniqueItems.push(key);
 								}
@@ -408,7 +417,7 @@ var is = require('is-helpers');
 								}
 							}
 							if (!matchInstance) {
-								addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed instance types'+message, schema.title));
+								errors.addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed instance types'+message, schema.title));
 							}
 						} // endif (schema.instance)
 
@@ -419,7 +428,7 @@ var is = require('is-helpers');
 								// make sure this is what you want!
 								if (schema.properties.hasOwnProperty(prop)) {
 									// don't worry; addError will not add an error if there is none
-									addError(validate(obj[prop], schema.properties[prop]), prop);
+									errors.addError(validate(obj[prop], schema.properties[prop]), prop);
 								}
 							} // end for (var p in schema.properties)
 						} // endif (schema.properties)
@@ -433,7 +442,7 @@ var is = require('is-helpers');
 										// NOTE: will go through obj's prototype chain; make sure
 										// this is what you want! don't worry; addError will not add
 										// an error if there is none
-										addError(validate(obj[objProp], schema.patternProperties[prop]), prop);
+										errors.addError(validate(obj[objProp], schema.patternProperties[prop]), prop);
 									}
 								} // end for (objProp in obj)
 							} // end for (prop in schema.patternProperties)
@@ -447,9 +456,9 @@ var is = require('is-helpers');
 							for (prop in obj) {
 								if (!is.inArray(prop, allowedProperties)) {
 									if (!schema.additionalProperties) {
-										addError(new ValidationError(schema.errLevel, 'Property '+prop+' is not allowed'+message, schema.title), prop);
+										errors.addError(new ValidationError(schema.errLevel, 'Property '+prop+' is not allowed'+message, schema.title), prop);
 									} else {
-										addError(validate(obj[prop], schema.additionalProperties), prop);
+										errors.addError(validate(obj[prop], schema.additionalProperties), prop);
 									}
 								} // endif (!propertyAllowed)
 							} // end for (var p in obj)
@@ -475,20 +484,20 @@ var is = require('is-helpers');
 					case 'number':
 						if (schema.minimum) {
 							if (schema.exclusiveMinimum && obj <= schema.minimum) {
-								addError(new ValidationError(schema.errLevel, 'Number is too small'+message, schema.title));
+								errors.addError(new ValidationError(schema.errLevel, 'Number is too small'+message, schema.title));
 							} else if (obj < schema.minimum) {
-								addError(new ValidationError(schema.errLevel, schema.message || 'Number is too small'+message, schema.title));
+								errors.addError(new ValidationError(schema.errLevel, schema.message || 'Number is too small'+message, schema.title));
 							}
 						}
 						if (schema.maximum) {
 							if (schema.exclusiveMaximum && obj >= schema.maximum) {
-								addError(new ValidationError(schema.errLevel, 'Number is too large'+message, schema.title));
+								errors.addError(new ValidationError(schema.errLevel, 'Number is too large'+message, schema.title));
 							} else if (obj > schema.maximum) {
-								addError(new ValidationError(schema.errLevel, schema.message || 'Number is too large'+message, schema.title));
+								errors.addError(new ValidationError(schema.errLevel, schema.message || 'Number is too large'+message, schema.title));
 							}
 						}
 						if (schema.divisibleBy && obj % schema.divisibleBy) {
-							addError(new ValidationError(schema.errLevel, 'Number is not divisible by '+schema.divisibleBy+message, schema.title));
+							errors.addError(new ValidationError(schema.errLevel, 'Number is not divisible by '+schema.divisibleBy+message, schema.title));
 						}
 						break;
 				} // end switch (type)
@@ -498,7 +507,7 @@ var is = require('is-helpers');
 
 			// enum - check against a list of allowed values (5.19)
 			if (schema['enum'] && (schema['enum'].indexOf(obj) === -1)) {
-				addError(new ValidationError(schema.errLevel, 'Value is not in allowable enum values'+message, schema.title));
+				errors.addError(new ValidationError(schema.errLevel, 'Value is not in allowable enum values'+message, schema.title));
 			}
 
 			/* function - a totally non-spec thing that I added myself, to allow me to
@@ -514,16 +523,18 @@ var is = require('is-helpers');
 				//   * on failure:  false, an error object, or an error message
 				funcResult = schema['function'](obj, fullObj);
 				if (!funcResult) {
-					addError(new ValidationError(schema.errLevel, 'Function failed'+message, schema.title));
+					errors.addError(new ValidationError(schema.errLevel, 'Function failed'+message, schema.title));
 				} else if (funcResult instanceof ValidationError) {
-					addError(funcResult);
+					errors.addError(funcResult);
 				} else if (typeof funcResult === 'string') {
-					addError(new ValidationError(null, funcResult+message, schema.title));
+					errors.addError(new ValidationError(null, funcResult+message, schema.title));
 				}
 			}
 			return errors;
 		}
 		return validate(obj, schema);
 	};
+
+
 
 })(typeof(window) === 'undefined' ? module.exports : (window.json = window.json || {}));
