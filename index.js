@@ -1,8 +1,8 @@
-var is = require('is-helpers');
 
 (function (exports) {
 	var ValidationError,
-		ErrorContainer;
+		ErrorContainer,
+		is = require('is-helpers');
 
 	/* ValidationError constructor; creates a simple ValidationError object with
 	 * the error level, an error message explaining what went wrong, and the
@@ -66,7 +66,9 @@ var is = require('is-helpers');
 
 	// merge an ErrorContainer instance with a passed instance
 	ErrorContainer.prototype.merge = function merge (containers) {
-		containers = Array.prototype.slice.call(containers, 0);
+		if (!is.array(containers)) {
+			containers = [containers];
+		}
 		for (var i = 0; i < containers.length; i ++) {
 			ErrorContainer.merge(this, containers[i]);
 		}
@@ -148,7 +150,7 @@ var is = require('is-helpers');
 	/*
 	 * Here's where the magic happens! validate() takes three arguments:
 	 *
-	 *   obj: any sort of value to be evaluated
+	 *   val: any sort of value to be evaluated
 	 *
 	 *   schema: a JSON Schema, which is a set of constraints in JSON format.
 	 *   More information (including the full spec) can be found at:
@@ -191,350 +193,422 @@ var is = require('is-helpers');
 	 *   errors. useful for checking small chunks of a schema. True means we don't
 	 *   create errors for missing required values. Default is false.
 	 */
-	exports.validate = function (obj, schema, partial) {
-		var fullObj = obj,
-			stackDepth = 0;
+
+	/* The actual validate() function is nothing but a closure that allows
+	 * us to insert validator functions into the schema and object. fullObj is
+	 * stored in the closure, and gives the custom validation function(s) the
+	 * ability to examine the entire object.
+	 *
+	 * Custom validation take two arguments:
+	 *
+	 * 		val: the object being validated
+	 *
+	 * 		fullObj: the entire object
+	 *
+	 * Example: given the following object and schema...
+	 *
+	 *  obj = {
+	 *  	province: 'BC',
+	 *  	country: 'USA'
+	 *  };
+	 *  schema = {
+	 *  	properties: {
+	 *  		province: {},
+	 *  		country: {
+	 *  			'function': function (val, partial, fullObj) {
+	 *  				var provinces = ['BC', 'AB', 'SK', 'MB', 'etc...'];
+	 *  				if (!partial
+	 * 						&& val !== 'Canada'
+	 *  					&& in.array(fullObj.province, provinces)) {
+	 *  					return 'Gave a Canadian province, but country was given as '+val;
+	 *  				}
+	 *  			}
+	 *  		}
+	 *  	}
+	 *  };
+	 *
+	 * the 'country' property fails because its schema includes a function that
+	 * checks the country against valid provinces. */
+
+	exports.validate = function validate (val, schema) {
+		var fullObj = val;
+
+		this.validateByFunction = function validateByFunction (val, fn) {
+			return fn(val, fullObj);
+		}
+
 		// recursive function to walk through all the nested validators
-		function validate (obj, schema) {
-			var i, j, prop, objProp,
-				errors = new ErrorContainer(),
-				message,
-				type,
-				disallowedType = false,
-				allowedTypes,
-				tempType,
-				pattern,
-				additionalStart = 0,
-				itemSchema,
-				uniqueItems = [],
-				instance,
-				matchInstance = false,
-				allowedProperties = [],
-				funcResult;
+		return doValidation(val, schema);
+	};
 
-			// prepare message for appending to specific failure messages
-			message = schema.message ? ', '+schema.message : '';
+	// this is where it all actually happens.
+	function doValidation (val, schema) {
+		var i,
+			errors = new ErrorContainer(),
+			type,
+			disallowedType = false,
+			allowedTypes,
+			tempType,
+			pattern,
+			itemSchema,
+			instance,
+			matchInstance = false,
+			allowedProperties = [],
+			funcResult;
 
-
-			// if it's undefined, there's really no point in doing the rest. Return
-			// early, with an error if this value is required and the 'partial' flag
-			// is not set.
-			if (obj === undefined) {
-				if (schema.required && !partial) {
-					errors.addError(new ValidationError(schema.errLevel, 'Required value is undefined'+message, schema.title));
-				}
-				return errors;
-			}
-
-			// determine the type of the object, with special cases for integers
-			type = typeof obj;
-			switch (type) {
-				case 'number':
-					if (is.integer(obj)) {
-						type = 'integer';
-					}
-					break;
-				case 'object':
-					if (obj === null) {
-						type = 'null';
-						break;
-					}
-					if (is.array(obj)) {
-						type = 'array';
-						break;
-					}
-					break;
-				default: // strings and booleans should work fine
-					break;
-			} // end switch(type)
-
-			// if the schema tells us the object has its own validator, then start out
-			// by validating that object by its own validator... then apply all the
-			// rest of the checks. Totally non-spec!
-			if (schema.hasValidator && (typeof obj[schema.hasValidator] === 'function')) {
-				// note: if the validator returns true, null, or undefined, there is no
-				// error. if it returns false, an error container, or a string, then it
-				// is an error -- converts the return vale to a ValidationError and
-				// records the error in our Error Container
-				errors = new ErrorContainer(obj[schema.hasValidator](obj, partial));
-			}
-
-			// check the allowed types; default is 'any' (5.1)
-			disallowedType = false;
-			if (schema.type) {
-				if (schema.type === 'any') {
-					allowedTypes = ['string', 'array', 'object', 'integer', 'number', 'null', 'boolean'];
-				} else {
-					allowedTypes = (typeof schema.type === 'string') ? [schema.type] : schema.type;
-				}
-				tempType = type === 'integer' ? 'number' : type;
-				if (!is.in(tempType, allowedTypes) && !is.in(type, allowedTypes)) {
-					disallowedType = true;
-					errors.addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed types'+message, schema.title));
-				}
-
-			}
-
-			// check for disallowed types; default is empty (5.25)
-			// the spec doesn't define what should happen in the case of a conflict
-			// between type and disallowed, so I'm just gonna assume that it checks
-			// for allowed types first and then for disallowed types second. In
-			// addition, the spec says that the format of this definition is the same,
-			// but that doesn't make sense for 'any'.
-			if (schema.disallowed && schema.disallowed !== 'any') {
-				tempType = type === 'integer' ? 'number' : type;
-				disallowedTypes = (is.array(schema.disallowed) ? schema.disallowed : [schema.disallowed]);
-				if (is.in(tempType, disallowedTypes) || is.in(type, disallowedTypes)) {
-					disallowedType = true;
-					errors.addError(new ValidationError(schema.errLevel, 'Object is one of the disallowed types'+message, schema.title));
-				}
-			}
-
-			// if this type is allowed, then we will waste time on constraint checking
-			// -- we want to save cycles, so if the type isn't allowed it won't bother
-			if (!disallowedType) {
-				switch (type) {
-
-					/* 'String' type
-					 * Relevant schema definitions:
-					 *
-					 *   minLength and maxLength: just what they sound like (5.17 and 5.18)
-					 *
-					 *   pattern: a string literal of a RegExp (minus /.../ delimiters and
-					 * 	 flags) (5.16)
-					 *
-					 *   format: a string specifying a certain format (regexes that define
-					 * 	 those formats are at the top of this module)
-					 */
-					case 'string':
-						//errors.merge(validateString(obj, schema));
-						if (schema.minLength && obj.length < schema.minLength) {
-							errors.addError(new ValidationError(schema.errLevel, 'String is too small'+message, schema.title));
-						}
-						if (schema.maxLength && obj.length > schema.maxLength) {
-							errors.addError(new ValidationError(schema.errLevel, 'String is too large'+message, schema.title));
-						}
-						if (schema.pattern) {
-							pattern = typeof schema.pattern === 'string'
-								? new RegExp(schema.pattern)
-								: schema.pattern;
-							if (!pattern.test(obj)) {
-								errors.addError(new ValidationError(schema.errLevel, 'String does not match pattern'+message, schema.title));
-							}
-						}
-						break;
-
-					/* 'Array' type
-					 * Relevant schema definitions
-					 *
-					 *   minItems and maxItems: just what they sound like (5.13 and 5.14)
-					 *
-					 *   items: either a schema against which all values must validate, or
-					 *   an array of schemas, in which case the array is treated as a
-					 *   finite-length list of tuples and must validate 1:1 against each
-					 *   of the schemas, in order (e.g., obj[0] validates against
-					 * 	 schema.items[0], obj[1] against schema.items[1], etc) (5.5)
-					 *
-					 *   additionalItems: only valid when items is an array of schemas.
-					 *   Either false (no additional items allowed), or a schema (5.6)
-					 *
-					 *   uniqueItems: default false. true if there are any duplicates in
-					 *   the array, using strict type checking (5.15)
-					 */
-					case 'array':
-						if (schema.minItems && obj.length < schema.minItems) {
-							errors.addError(new ValidationError(schema.errLevel, 'Array has too few items'+message, schema.title));
-						}
-						if (schema.maxItems && obj.length > schema.maxItems) {
-							errors.addError(new ValidationError(schema.errLevel, 'Array has too many items'+message, schema.title));
-						}
-						if (schema.items) {
-							for (j = 0; j < obj.length; j++) {
-								if (is.array(schema.items)) {
-									if (j >= schema.items.length) {
-										// if items is a tuple list, fail once it gets past the
-										// number of specified tuples
-										additionalStart = j;
-										continue;
-									}
-									itemSchema = schema.items[j];
-								} else {
-									itemSchema = schema.items;
-								}
-								// adds the error as an Error Container to a numeric property j,
-								// corresponding to the item's index
-								errors.addError(validate(obj[j], itemSchema), j);
-							}
-							if (additionalStart) {
-								if (schema.additionalItems) {
-									// start where we left off (additionalStart) and continue with
-									// the schema defined by additionalItems
-									for (j = additionalStart; j < obj.length; j++) {
-										errors.addError(validate(obj[j], schema.additionalItems), j);
-									}
-								} else {
-									errors.addError(new ValidationError(schema.errLevel, 'Array cannot have additional items'+message, schema.title));
-								}
-							}
-						}
-						if (schema.uniqueItems) {
-							for (j = 0; j < obj.length; j++) {
-								key = obj[j];
-								if (typeof key !== 'number' && key !== null && key !== undefined && typeof key !== 'boolean') {
-									key = JSON.stringify(key);
-								}
-								if (is.inArray(key, uniqueItems)) {
-									errors.addError(new ValidationError(schema.errLevel, 'This array item is a duplicate'+message, schema.title), j);
-								} else {
-									uniqueItems.push(key);
-								}
-							}
-						}
-						break;
-
-					/* 'Object' type
-					 *
-					 * Relevant schema definitions:
-					 *
-					 *   properties: a hashtable of allowed properties and schemas (5.2)
-					 *
-					 *   patternProperties: a hashtable of patterns that allowed property
-					 *   names must match against, and their schemas (5.3)
-					 *
-					 *   addtionalProperties: either false (no allowed additional
-					 * 	 properties) or a schema against which all leftover properties
-					 *   must validate
-					 */
-					case 'object':
-						if (schema.instance) {
-							// diverges from the spec; allows you to check against a bunch of
-							// parents to assert a certain prototype chain. Note: If Object is
-							// one of the allowed parents, it'll always succeed.
-							instance = is.array(schema.instance) ? schema.instance : [schema.instance];
-							for (var j = 0; j < instance.length; j ++) {
-								if (obj instanceof instance[j]) {
-									matchInstance = true;
-								}
-							}
-							if (!matchInstance) {
-								errors.addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed instance types'+message, schema.title));
-							}
-						} // endif (schema.instance)
-
-						if (schema.properties) {
-							for (prop in schema.properties) {
-								allowedProperties.push(prop);
-								// NOTE: will go through obj's prototype chain;
-								// make sure this is what you want!
-								if (schema.properties.hasOwnProperty(prop)) {
-									// don't worry; addError will not add an error if there is none
-									errors.addError(validate(obj[prop], schema.properties[prop]), prop);
-								}
-							} // end for (var p in schema.properties)
-						} // endif (schema.properties)
-
-						if (schema.patternProperties) {
-							for (prop in schema.patternProperties) {
-								pattern = new RegExp(prop);
-								for (objProp in obj) {
-									if (pattern.test(objProp)) {
-										allowedProperties.push(objProp);
-										// NOTE: will go through obj's prototype chain; make sure
-										// this is what you want! don't worry; addError will not add
-										// an error if there is none
-										errors.addError(validate(obj[objProp], schema.patternProperties[prop]), prop);
-									}
-								} // end for (objProp in obj)
-							} // end for (prop in schema.patternProperties)
-						} // endif (schema.patternProperties)
-
-						// if property is not allowed by either properties or
-						// additionalProperties, check to see if we're allowed to have
-						// additional properties; otherwise, give an error. Default is
-						// an empty schema which validates everything
-						if (schema.additionalProperties !== undefined) {
-							for (prop in obj) {
-								if (!is.inArray(prop, allowedProperties)) {
-									if (!schema.additionalProperties) {
-										errors.addError(new ValidationError(schema.errLevel, 'Property '+prop+' is not allowed'+message, schema.title), prop);
-									} else {
-										errors.addError(validate(obj[prop], schema.additionalProperties), prop);
-									}
-								} // endif (!propertyAllowed)
-							} // end for (var p in obj)
-						} // endif (schema.additionalProperties !== undefined)
-						break;
-
-					/* 'integer' and 'number' types
-					 * (Note: integer is also number, of course, but must not be a float)
-					 * Relevant schema definitions:
-					 *
-					 *   minimum and maximum: just what they sound like (5.9 and 5.10)
-					 *
-					 *   exclusiveMinimum and exclusiveMaximum: default false. If true,
-					 *   the minimum and maxium values must not equal the value being
-					 *   validated. E.g., when exclusiveMinimum = true and minimum = 3,
-					 *   3.015 validates but 3 doesn't. (5.11 and 5.12)
-					 *
-					 *   divisibleBy: a number to divide the value by. If there's a
-					 *   remainder, the validation fails. (5.24)
-					 */
-					case 'integer':
-						// fall through to number
-					case 'number':
-						if (schema.minimum) {
-							if (schema.exclusiveMinimum && obj <= schema.minimum) {
-								errors.addError(new ValidationError(schema.errLevel, 'Number is too small'+message, schema.title));
-							} else if (obj < schema.minimum) {
-								errors.addError(new ValidationError(schema.errLevel, schema.message || 'Number is too small'+message, schema.title));
-							}
-						}
-						if (schema.maximum) {
-							if (schema.exclusiveMaximum && obj >= schema.maximum) {
-								errors.addError(new ValidationError(schema.errLevel, 'Number is too large'+message, schema.title));
-							} else if (obj > schema.maximum) {
-								errors.addError(new ValidationError(schema.errLevel, schema.message || 'Number is too large'+message, schema.title));
-							}
-						}
-						if (schema.divisibleBy && obj % schema.divisibleBy) {
-							errors.addError(new ValidationError(schema.errLevel, 'Number is not divisible by '+schema.divisibleBy+message, schema.title));
-						}
-						break;
-				} // end switch (type)
-			} // end if (!disallowedType)
-
-			// Hereafter lie the type-agnostic checks!
-
-			// enum - check against a list of allowed values (5.19)
-			if (schema['enum'] && (schema['enum'].indexOf(obj) === -1)) {
-				errors.addError(new ValidationError(schema.errLevel, 'Value is not in allowable enum values'+message, schema.title));
-			}
-
-			/* function - a totally non-spec thing that I added myself, to allow me to
-			 * pass custom validators. A custom validator receives the value being
-			 * tested and a reference to the entire object, and returns:
-			 *   on success: true, null, or undefined
-			 *   on failure: false, a ValidationError object, or an error message
-			 */
-			if (typeof schema['function'] === 'function') {
-				// function should accept the value and a reference to the
-				// entire object, then return one of five values:
-				//   * on success: true or undefined
-				//   * on failure:  false, an error object, or an error message
-				funcResult = schema['function'](obj, fullObj);
-				if (!funcResult) {
-					errors.addError(new ValidationError(schema.errLevel, 'Function failed'+message, schema.title));
-				} else if (funcResult instanceof ValidationError) {
-					errors.addError(funcResult);
-				} else if (typeof funcResult === 'string') {
-					errors.addError(new ValidationError(null, funcResult+message, schema.title));
-				}
+		/* if it's undefined, there's really no point in doing the rest. Return
+		 * early with an error. */
+		if (val === undefined) {
+			if (schema.required) {
+				errors.addError(new ValidationError(schema.errLevel, 'Required value is undefined', schema.title));
 			}
 			return errors;
 		}
-		return validate(obj, schema);
+
+		// determine the type of the object, with special cases for integers
+		type = typeof val;
+		switch (type) {
+			case 'number':
+				if (is.integer(val)) {
+					type = 'integer';
+				}
+				break;
+			case 'object':
+				if (val === null) {
+					type = 'null';
+					break;
+				}
+				if (is.array(val)) {
+					type = 'array';
+					break;
+				}
+				break;
+			default: // strings and booleans should work fine
+				break;
+		} // end switch(type)
+
+		/* if the schema tells us the object has its own validator, then
+		 * start out by validating that object by its own validator... then
+		 * apply all the rest of the checks. Totally non-spec! */
+		if (schema.hasValidator !== undefined && is.function(val[schema.hasValidator])) {
+			/* note: if the validator returns true, null, or undefined,
+			 * there is no error. if it returns false, an ErrorContainer,
+			 * or a string, then it is an error -- converts the return value
+			 * to a ValidationError and records the error in our
+			 * ErrorContainer */
+			errors = new ErrorContainer(validate.validateByFunction(val, val[schema.hasValidator]));
+		}
+
+		// check the allowed types; default is 'any' (5.1)
+		disallowedType = false;
+		if (schema.type) {
+			if (schema.type === 'any') {
+				allowedTypes = ['string', 'array', 'object', 'integer', 'number', 'null', 'boolean'];
+			} else {
+				allowedTypes = (typeof schema.type === 'string') ? [schema.type] : schema.type;
+			}
+			tempType = type === 'integer' ? 'number' : type;
+			if (!is.in(tempType, allowedTypes) && !is.in(type, allowedTypes)) {
+				disallowedType = true;
+				errors.addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed types', schema.title));
+			}
+
+		}
+
+		// check for disallowed types; default is empty (5.25)
+		// the spec doesn't define what should happen in the case of a conflict
+		// between type and disallowed, so I'm just gonna assume that it checks
+		// for allowed types first and then for disallowed types second. In
+		// addition, the spec says that the format of this definition is the same,
+		// but that doesn't make sense for 'any'.
+		if (schema.disallowed && schema.disallowed !== 'any') {
+			tempType = type === 'integer' ? 'number' : type;
+			disallowedTypes = (is.array(schema.disallowed) ? schema.disallowed : [schema.disallowed]);
+			if (is.in(tempType, disallowedTypes) || is.in(type, disallowedTypes)) {
+				disallowedType = true;
+				errors.addError(new ValidationError(schema.errLevel, 'Object is one of the disallowed types', schema.title));
+			}
+		}
+
+		// if this type is allowed, then we will waste time on constraint checking
+		// -- we want to save cycles, so if the type isn't allowed it won't bother
+		if (!disallowedType) {
+			switch (type) {
+
+				case 'string':
+					errors.merge(validateString(val, schema));
+					break;
+
+				case 'array':
+					errors.merge(validateArray(val, schema));
+					break;
+
+				case 'object':
+					errors.merge(validateObject(val, schema));
+					break;
+
+				case 'integer':
+					// fall through to number
+				case 'number':
+					errors.merge(validateNumber(val, schema));
+					break;
+			} // end switch (type)
+		} // end if (!disallowedType)
+
+		// Hereafter lie the type-agnostic checks!
+
+		// enum - check against a list of allowed values (5.19)
+		if (schema['enum'] && (schema['enum'].indexOf(val) === -1)) {
+			errors.addError(new ValidationError(schema.errLevel, 'Value is not in allowable enum values', schema.title));
+		}
+
+		/* function - a totally non-spec thing that I added myself, to allow me to
+		 * pass custom validators. A custom validator receives the value being
+		 * tested and a reference to the entire object, and returns:
+		 *   on success: true, null, or undefined
+		 *   on failure: false, a ValidationError object, or an error message
+		 */
+		if (is.function(schema['function'])) {
+			// function should accept the value and a reference to the
+			// entire object, then return one of five values:
+			//   * on success: true or undefined
+			//   * on failure:  false, an error object, or an error message
+			funcResult = validator.validateByFunction(val, schema['function']);
+			if (!funcResult) {
+				errors.addError(new ValidationError(schema.errLevel, 'Function failed', schema.title));
+			} else if (funcResult instanceof ValidationError) {
+				errors.addError(funcResult);
+			} else if (typeof funcResult === 'string') {
+				errors.addError(new ValidationError(null, funcResult, schema.title));
+			}
+		}
+		return errors;
 	};
 
 
+	/* 'String' type
+	 * Relevant schema definitions:
+	 *
+	 *   minLength and maxLength: just what they sound like (5.17 and 5.18)
+	 *
+	 *   pattern: a string literal of a RegExp (minus /.../ delimiters and
+	 *   flags) (5.16)
+	 *
+	 *   format: a string specifying a certain format - not implemented yet
+	 */
+	function validateString (val, schema) {
+		var errors = new ErrorContainer();
+
+		if (schema.minLength && val.length < schema.minLength) {
+			errors.addError(new ValidationError(schema.errLevel, 'String is too small', schema.title));
+		}
+		if (schema.maxLength && val.length > schema.maxLength) {
+			errors.addError(new ValidationError(schema.errLevel, 'String is too large', schema.title));
+		}
+		if (schema.pattern) {
+			pattern = typeof schema.pattern === 'string'
+				? new RegExp(schema.pattern)
+				: schema.pattern;
+			if (!pattern.test(val)) {
+				errors.addError(new ValidationError(schema.errLevel, 'String does not match pattern', schema.title));
+			}
+		}
+		return errors;
+	}
+
+	/* 'Array' type
+	 * Relevant schema definitions
+	 *
+	 *   minItems and maxItems: just what they sound like (5.13 and 5.14)
+	 *
+	 *   items: either a schema against which all values must validate, or
+	 *   an array of schemas, in which case the array is treated as a
+	 *   finite-length list of tuples and must validate 1:1 against each
+	 *   of the schemas, in order (e.g., val[0] validates against
+	 * 	 schema.items[0], val[1] against schema.items[1], etc) (5.5)
+	 *
+	 *   additionalItems: only valid when items is an array of schemas.
+	 *   Either false (no additional items allowed), or a schema (5.6)
+	 *
+	 *   uniqueItems: default false. true if there are any duplicates in
+	 *   the array, using strict type checking (5.15)
+	 */
+	function validateArray (val, schema) {
+		var i,
+			errors = new ErrorContainer(),
+			additionalStart = 0,
+			itemSchema,
+			key,
+			uniqueItems = [];
+
+		if (schema.minItems && val.length < schema.minItems) {
+			errors.addError(new ValidationError(schema.errLevel, 'Array has too few items', schema.title));
+		}
+		if (schema.maxItems && val.length > schema.maxItems) {
+			errors.addError(new ValidationError(schema.errLevel, 'Array has too many items', schema.title));
+		}
+		if (schema.items) {
+			for (i = 0; i < val.length; i++) {
+				if (is.array(schema.items)) {
+					if (i >= schema.items.length) {
+						// if items is a tuple list, fail once it gets past the
+						// number of specified tuples
+						additionalStart = i;
+						continue;
+					}
+					itemSchema = schema.items[i];
+				} else {
+					itemSchema = schema.items;
+				}
+				// adds the error as an Error Container to a numeric property j,
+				// corresponding to the item's index
+				errors.addError(doValidation(val[i], itemSchema), i);
+			}
+			if (additionalStart) {
+				if (schema.additionalItems) {
+					// start where we left off (additionalStart) and continue with
+					// the schema defined by additionalItems
+					for (i = additionalStart; i < val.length; i++) {
+						errors.addError(doValidation(val[i], schema.additionalItems), i);
+					}
+				} else {
+					errors.addError(new ValidationError(schema.errLevel, 'Array cannot have additional items', schema.title));
+				}
+			}
+		}
+		if (schema.uniqueItems) {
+			for (i = 0; i < val.length; i++) {
+				key = val[i];
+				if (typeof key !== 'number' && key !== null && key !== undefined && typeof key !== 'boolean') {
+					key = JSON.stringify(key);
+				}
+				if (is.inArray(key, uniqueItems)) {
+					errors.addError(new ValidationError(schema.errLevel, 'This array item is a duplicate', schema.title), i);
+				} else {
+					uniqueItems.push(key);
+				}
+			}
+		}
+		return errors;
+	}; // end function validateArray
+
+	/* 'Object' type
+	 *
+	 * Relevant schema definitions:
+	 *
+	 *   properties: a hashtable of allowed properties and schemas (5.2)
+	 *
+	 *   patternProperties: a hashtable of patterns that allowed property
+	 *   names must match against, and their schemas (5.3)
+	 *
+	 *   addtionalProperties: either false (no allowed additional
+	 * 	 properties) or a schema against which all leftover properties
+	 *   must validate
+	 */
+	function validateObject (val, schema) {
+		var i, prop,
+			errors = new ErrorContainer(),
+			instance,
+			matchInstance = false,
+			allowedProperties = [],
+			pattern,
+			valProp;
+
+		if (schema.instance) {
+			/* diverges from the spec; allows you to check against a bunch of
+			 * parents to assert a certain prototype chain. Note: If the Object
+			 * object is one of the allowed parents, it'll always succeed. */
+			instance = is.array(schema.instance) ? schema.instance : [schema.instance];
+			for (var i = 0; i < instance.length; i ++) {
+				if (val instanceof instance[i]) {
+					matchInstance = true;
+				}
+			}
+			if (!matchInstance) {
+				errors.addError(new ValidationError(schema.errLevel, 'Object is not one of the allowed instance types', schema.title));
+			}
+		} // endif (schema.instance)
+
+		if (schema.properties) {
+			for (prop in schema.properties) {
+				allowedProperties.push(prop);
+				// NOTE: will go through val's prototype chain;
+				// make sure this is what you want!
+				if (schema.properties.hasOwnProperty(prop)) {
+					// don't worry; addError will not add an error if there is none
+					errors.addError(doValidation(val[prop], schema.properties[prop]), prop);
+				}
+			} // end for (prop in schema.properties)
+		} // endif (schema.properties)
+
+		if (schema.patternProperties) {
+			for (prop in schema.patternProperties) {
+				pattern = new RegExp(prop);
+				for (valProp in val) {
+					if (pattern.test(valProp)) {
+						allowedProperties.push(valProp);
+						// NOTE: will go through val's prototype chain; make sure
+						// this is what you want! don't worry; addError will not add
+						// an error if there is none
+						errors.addError(doValidation(val[valProp], schema.patternProperties[prop]), prop);
+					}
+				} // end for (valProp in val)
+			} // end for (prop in schema.patternProperties)
+		} // endif (schema.patternProperties)
+
+		// if property is not allowed by either properties or
+		// additionalProperties, check to see if we're allowed to have
+		// additional properties; otherwise, give an error. Default is
+		// an empty schema which validates everything
+		if (schema.additionalProperties !== undefined) {
+			for (prop in val) {
+				if (!is.inArray(prop, allowedProperties)) {
+					if (!schema.additionalProperties) {
+						errors.addError(new ValidationError(schema.errLevel, 'Property '+prop+' is not allowed', schema.title), prop);
+					} else {
+						errors.addError(doValidation(val[prop], schema.additionalProperties), prop);
+					}
+				} // endif (!propertyAllowed)
+			} // end for (prop in val)
+		} // endif (schema.additionalProperties !== undefined)
+		return errors;
+	}; // end function validateObject
+
+	/* 'integer' and 'number' types
+	 * (Note: integer is also number, of course, but must not be a float)
+	 * Relevant schema definitions:
+	 *
+	 *   minimum and maximum: just what they sound like (5.9 and 5.10)
+	 *
+	 *   exclusiveMinimum and exclusiveMaximum: default false. If true,
+	 *   the minimum and maxium values must not equal the value being
+	 *   validated. E.g., when exclusiveMinimum = true and minimum = 3,
+	 *   3.015 validates but 3 doesn't. (5.11 and 5.12)
+	 *
+	 *   divisibleBy: a number to divide the value by. If there's a
+	 *   remainder, the validation fails. (5.24)
+	 */
+	function validateNumber (val, schema) {
+		var errors = new ErrorContainer();
+
+		if (schema.minimum) {
+			if (schema.exclusiveMinimum && val <= schema.minimum) {
+				errors.addError(new ValidationError(schema.errLevel, 'Number is too small', schema.title));
+			} else if (val < schema.minimum) {
+				errors.addError(new ValidationError(schema.errLevel, schema.message || 'Number is too small', schema.title));
+			}
+		}
+		if (schema.maximum) {
+			if (schema.exclusiveMaximum && val >= schema.maximum) {
+				errors.addError(new ValidationError(schema.errLevel, 'Number is too large', schema.title));
+			} else if (val > schema.maximum) {
+				errors.addError(new ValidationError(schema.errLevel, schema.message || 'Number is too large', schema.title));
+			}
+		}
+		if (schema.divisibleBy && val % schema.divisibleBy) {
+			errors.addError(new ValidationError(schema.errLevel, 'Number is not divisible by '+schema.divisibleBy, schema.title));
+		}
+		return errors;
+	}; // end function validateNumber
 
 })(typeof(window) === 'undefined' ? module.exports : (window.json = window.json || {}));

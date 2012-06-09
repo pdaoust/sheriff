@@ -16,7 +16,6 @@ describe('validator-integer', function () {
 	});
 	it('should recognise 3.145 as a number', function () {
 		var result = validator.validate(3.145, {type: 'number'});
-		//console.log(result);
 		expect(result.$counts.$total).toBeFalsy();
 	});
 	it('should not recognise 3.15 as an integer', function () {
