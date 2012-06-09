@@ -2,6 +2,7 @@
  * @author Paul d'Aoust
  */
 
+var is = require('is-helpers');
 var validator = require('../index');
 
 describe('validator-misc', function () {
@@ -107,6 +108,100 @@ describe('validator-misc', function () {
 	it('should recognise null as disallowed', function () {
 		var result = validator.validate(null, {disallowed: 'null'});
 		expect(result.$counts.$total).toBeTruthy();
+	});
+
+	// functions
+	it('should validate obj\'s address against a custom function in schema and fail because the country is non-Canadian', function () {
+		var obj = {
+			province: 'BC',
+			country: 'USA'
+		};
+		var schema = {
+			properties: {
+				province: {},
+				country: {
+					'function': function (val, fullObj) {
+						var provinces = ['BC', 'AB', 'SK', 'MB', 'ON', 'QC', 'etc'];
+						if (val !== 'Canada'
+							&& is.inArray(fullObj.province, provinces)) {
+							return 'Gave a Canadian province, but country was given as '+val;
+						}
+					}
+				}
+			}
+		};
+		var result = validator.validate(obj, schema);
+		expect(result.$counts.$total).toBeTruthy();
+	});
+	it('should validate obj\'s address against a custom function in schema and succeed because the country is Canadian', function () {
+		var obj = {
+			province: 'BC',
+			country: 'Canada'
+		};
+		var schema = {
+			properties: {
+				province: {},
+				country: {
+					'function': function (val, fullObj) {
+						var provinces = ['BC', 'AB', 'SK', 'MB', 'ON', 'QC', 'etc'];
+						if (val !== 'Canada'
+							&& is.inArray(fullObj.province, provinces)) {
+							return 'Gave a Canadian province, but country was given as '+val;
+						}
+					}
+				}
+			}
+		};
+		var result = validator.validate(obj, schema);
+		expect(result.$counts.$total).toBeFalsy();
+	});
+	it('should validate obj\'s properties with a custom function in obj and fail because the widget has too few throbneys', function () {
+		var obj = {
+			floobers: 20,
+			widget: {
+				slabsters: 15,
+				throbneys: 17,
+				validator: function (val, fullObj) {
+					if (val.throbneys < fullObj.floobers + fullObj.widget.slabsters) {
+						return 'throbneys must be equal to or greater than sum of floobers and slabsters';
+					}
+				}
+			}
+		}
+		var schema = {
+			properties: {
+				floobers: 'number',
+				widget: {
+					hasValidator: 'validator'
+				}
+			}
+		};
+		var result = validator.validate(obj, schema);
+		expect(result.$counts.$total).toBeTruthy();
+	});
+	it('should validate obj\'s properties with a custom function in obj and succeed because the widget has enough throbneys', function () {
+		var obj = {
+			floobers: 20,
+			widget: {
+				slabsters: 15,
+				throbneys: 36,
+				validator: function (val, fullObj) {
+					if (val.throbneys < fullObj.floobers + fullObj.widget.slabsters) {
+						return 'throbneys must be equal to or greater than sum of floobers and slabsters';
+					}
+				}
+			}
+		}
+		var schema = {
+			properties: {
+				floobers: 'number',
+				widget: {
+					hasValidator: 'validator'
+				}
+			}
+		};
+		var result = validator.validate(obj, schema);
+		expect(result.$counts.$total).toBeFalsy();
 	});
 
 });

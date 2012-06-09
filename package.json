@@ -2,7 +2,7 @@
   "author": "Paul d'Aoust <paul@heliosstudio.ca> (http://heliosstudio.ca)",
   "name": "helios-validator",
   "description": "A validator based loosely on JSON Schema, with the ability to throw custom functions into the schema.",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "main": "index.js",
   "scripts": {
     "test": "jasmine-node tests/"

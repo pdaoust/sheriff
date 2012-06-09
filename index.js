@@ -151,8 +151,11 @@
 	 *
 	 *   val: any sort of value to be evaluated
 	 *
-	 *   schema: a JSON Schema, which is a set of constraints in JSON format.
-	 *   More information (including the full spec) can be found at:
+	 *   schema: either a JSON Schema, which is a set of constraints in JSON
+	 * 		     format, or
+	 * 			 a validator function (more later)
+	 *
+	 *   More information on the JSON Schema spec can be found at:
 	 *
 	 *     http://json-schema.org/
 	 *
@@ -187,18 +190,36 @@
 	 *     but imagine having to sniff binary types for images, audio, etc! (6.4)
 	 *
 	 *     mediaType: Not sure what this one is for (6.6)
-	 */
-
-	/* The actual validate() function is nothing but a closure that allows
-	 * us to insert validator functions into the schema and object. fullObj is
-	 * stored in the closure, and gives the custom validation function(s) the
-	 * ability to examine the entire object.
 	 *
-	 * Custom validation take two arguments:
+	 * The actual validate() function is nothing but a function that calls the
+	 * actual recursive validator function (doValidate), which is not publicly available.
+	 * Once doValidate() finishes, validate() checks the contents of the
+	 * returned ErrorContainer. If there's no error, it returns true rather
+	 * than an ErrorContainer.
 	 *
-	 * 		val: the object being validated
+	 * VALIDATOR FUNCTIONS
 	 *
-	 * 		fullObj: the entire object
+	 * This validator diverges from the spec in that it can allow validator
+	 * functions to be inserted in a number of different places:
+	 *
+	 * 		as a validator itself: rather than a JSON schema, the 'schema'
+	 * 		argument can simply be a function
+	 *
+	 * 		as a property of the object being validated: the schema indicates
+	 * 		that the object has its own validator function with the
+	 * 		'hasValidator' keyword, which points to a property of the object
+	 * 		where the validator function resides. Naturally, this only works
+	 * 		when the object being validated is actually an object.
+	 *
+	 * 		as a 'function' property of the schema itself.
+	 *
+	 * A validator function should take two arguments:
+	 *
+	 * 		val: the value being currently validated, of course
+	 *
+	 * 		fullObj: the entire object that was originally passed to the
+	 * 		validate() function. This allows the validator function to check
+	 * 		other properties to make sure everything is in order.
 	 *
 	 * Example: given the following object and schema...
 	 *
@@ -210,11 +231,11 @@
 	 *  	properties: {
 	 *  		province: {},
 	 *  		country: {
-	 *  			'function': function (val, partial, fullObj) {
+	 *  			'function': function (val, fullObj) {
 	 *  				var provinces = ['BC', 'AB', 'SK', 'MB', 'etc...'];
 	 *  				if (!partial
 	 * 						&& val !== 'Canada'
-	 *  					&& in.array(fullObj.province, provinces)) {
+	 *  					&& is.inArray(fullObj.province, provinces)) {
 	 *  					return 'Gave a Canadian province, but country was given as '+val;
 	 *  				}
 	 *  			}
@@ -225,30 +246,20 @@
 	 * the 'country' property fails because its schema includes a function that
 	 * checks the country against valid provinces. */
 
-	exports.validate = function validate (val, schema) {
-		var fullObj = val;
+	var validate = exports.validate = (function validate (val, schema) {
+		return doValidation(val, schema, val);
+	});
 
-		this.validateByFunction = function validateByFunction (val, fn) {
-			return fn(val, fullObj);
-		}
-
-		// recursive function to walk through all the nested validators
-		return doValidation(val, schema);
-	};
-
-	// this is where it all actually happens.
-	function doValidation (val, schema) {
+	/* this is where it all actually happens. A function which determines the
+	 * type of a value, determines whether it matches the type and whether it's
+	 * required or not, and farms things out to various other functions. */
+	function doValidation (val, schema, fullObj) {
 		var i,
 			errors = new ErrorContainer(),
 			type,
 			disallowedType = false,
 			allowedTypes,
 			tempType,
-			pattern,
-			itemSchema,
-			instance,
-			matchInstance = false,
-			allowedProperties = [],
 			funcResult;
 
 		/* if it's undefined, there's really no point in doing the rest. Return
@@ -258,6 +269,19 @@
 				errors.addError(new ValidationError(schema.errLevel, 'Required value is undefined', schema.title));
 			}
 			return errors;
+		}
+
+		/* you can pass in a function rather than a JSON schema, and it'll work
+		 * just fine. This function should follow the convention of validator
+		 * functions described above -- takes val and fullObj as arguments,
+		 * and returns:
+		 *
+		 * 		on success: true, null, or undefined
+		 * 		on failure: false, an ErrorObject, ValidationError, or message
+		 * 					string
+		 */
+		if (is.function(schema)) {
+			return new ErrorContainer(schema(val, fullObj));
 		}
 
 		// determine the type of the object, with special cases for integers
@@ -284,14 +308,11 @@
 
 		/* if the schema tells us the object has its own validator, then
 		 * start out by validating that object by its own validator... then
-		 * apply all the rest of the checks. Totally non-spec! */
+		 * apply all the rest of the checks. Totally non-spec; see the above
+		 * section on validator functions for more info on how this function
+		 * should operate. */
 		if (schema.hasValidator !== undefined && is.function(val[schema.hasValidator])) {
-			/* note: if the validator returns true, null, or undefined,
-			 * there is no error. if it returns false, an ErrorContainer,
-			 * or a string, then it is an error -- converts the return value
-			 * to a ValidationError and records the error in our
-			 * ErrorContainer */
-			errors = new ErrorContainer(validate.validateByFunction(val, val[schema.hasValidator]));
+			errors = new ErrorContainer(val[schema.hasValidator](val, fullObj));
 		}
 
 		// check the allowed types; default is 'any' (5.1)
@@ -335,11 +356,14 @@
 					break;
 
 				case 'array':
-					errors.merge(validateArray(val, schema));
+					/* arrays need access to the full object, in case any of the
+					 * child values or schemas have validator functions */
+					errors.merge(validateArray(val, schema, fullObj));
 					break;
 
 				case 'object':
-					errors.merge(validateObject(val, schema));
+					/* same with objects */
+					errors.merge(validateObject(val, schema, fullObj));
 					break;
 
 				case 'integer':
@@ -357,22 +381,18 @@
 			errors.addError(new ValidationError(schema.errLevel, 'Value is not in allowable enum values', schema.title));
 		}
 
-		/* function - a totally non-spec thing that I added myself, to allow me to
-		 * pass custom validators. A custom validator receives the value being
-		 * tested and a reference to the entire object, and returns:
-		 *   on success: true, null, or undefined
-		 *   on failure: false, a ValidationError object, or an error message
+		/* function - a totally non-spec thing that I added myself, to allow me
+		 * to pass custom validators. See above on validator functions to find
+		 * out how this function should work.
 		 */
 		if (is.function(schema['function'])) {
-			// function should accept the value and a reference to the
-			// entire object, then return one of five values:
-			//   * on success: true or undefined
-			//   * on failure:  false, an error object, or an error message
-			funcResult = validator.validateByFunction(val, schema['function']);
-			if (!funcResult) {
+			funcResult = schema['function'](val, fullObj);
+			if (funcResult === false) {
 				errors.addError(new ValidationError(schema.errLevel, 'Function failed', schema.title));
 			} else if (funcResult instanceof ValidationError) {
 				errors.addError(funcResult);
+			} else if (funcResult instanceof ErrorContainer) {
+				errors.merge(funcResult);
 			} else if (typeof funcResult === 'string') {
 				errors.addError(new ValidationError(null, funcResult, schema.title));
 			}
@@ -392,7 +412,8 @@
 	 *   format: a string specifying a certain format - not implemented yet
 	 */
 	function validateString (val, schema) {
-		var errors = new ErrorContainer();
+		var errors = new ErrorContainer(),
+			pattern;
 
 		if (schema.minLength && val.length < schema.minLength) {
 			errors.addError(new ValidationError(schema.errLevel, 'String is too small', schema.title));
@@ -428,7 +449,7 @@
 	 *   uniqueItems: default false. true if there are any duplicates in
 	 *   the array, using strict type checking (5.15)
 	 */
-	function validateArray (val, schema) {
+	function validateArray (val, schema, fullObj) {
 		var i,
 			errors = new ErrorContainer(),
 			additionalStart = 0,
@@ -457,14 +478,14 @@
 				}
 				// adds the error as an Error Container to a numeric property j,
 				// corresponding to the item's index
-				errors.addError(doValidation(val[i], itemSchema), i);
+				errors.addError(doValidation(val[i], itemSchema, fullObj), i);
 			}
 			if (additionalStart) {
 				if (schema.additionalItems) {
 					// start where we left off (additionalStart) and continue with
 					// the schema defined by additionalItems
 					for (i = additionalStart; i < val.length; i++) {
-						errors.addError(doValidation(val[i], schema.additionalItems), i);
+						errors.addError(doValidation(val[i], schema.additionalItems, fullObj), i);
 					}
 				} else {
 					errors.addError(new ValidationError(schema.errLevel, 'Array cannot have additional items', schema.title));
@@ -500,7 +521,7 @@
 	 * 	 properties) or a schema against which all leftover properties
 	 *   must validate
 	 */
-	function validateObject (val, schema) {
+	function validateObject (val, schema, fullObj) {
 		var i, prop,
 			errors = new ErrorContainer(),
 			instance,
@@ -531,7 +552,7 @@
 				// make sure this is what you want!
 				if (schema.properties.hasOwnProperty(prop)) {
 					// don't worry; addError will not add an error if there is none
-					errors.addError(doValidation(val[prop], schema.properties[prop]), prop);
+					errors.addError(doValidation(val[prop], schema.properties[prop], fullObj), prop);
 				}
 			} // end for (prop in schema.properties)
 		} // endif (schema.properties)
@@ -545,7 +566,7 @@
 						// NOTE: will go through val's prototype chain; make sure
 						// this is what you want! don't worry; addError will not add
 						// an error if there is none
-						errors.addError(doValidation(val[valProp], schema.patternProperties[prop]), prop);
+						errors.addError(doValidation(val[valProp], schema.patternProperties[prop], fullObj), prop);
 					}
 				} // end for (valProp in val)
 			} // end for (prop in schema.patternProperties)
@@ -561,7 +582,7 @@
 					if (!schema.additionalProperties) {
 						errors.addError(new ValidationError(schema.errLevel, 'Property '+prop+' is not allowed', schema.title), prop);
 					} else {
-						errors.addError(doValidation(val[prop], schema.additionalProperties), prop);
+						errors.addError(doValidation(val[prop], schema.additionalProperties, fullObj), prop);
 					}
 				} // endif (!propertyAllowed)
 			} // end for (prop in val)
