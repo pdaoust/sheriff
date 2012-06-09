@@ -1,4 +1,3 @@
-
 (function (exports) {
 	var ValidationError,
 		ErrorContainer,
