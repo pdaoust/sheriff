@@ -1,7 +1,9 @@
 (function (exports) {
 	var ValidationError,
 		ErrorContainer,
-		is = require('is-helpers');
+		wrangler = require('wrangler'),
+		is = wrangler.is,
+		to = wrangler.to;
 
 	/* ValidationError constructor; creates a simple ValidationError object with
 	 * the error level, an error message explaining what went wrong, and the
@@ -246,9 +248,12 @@
 	 * the 'country' property fails because its schema includes a function that
 	 * checks the country against valid provinces. */
 
-	var validate = exports.validate = (function validate (val, schema) {
-		return doValidation(val, schema, val);
-	});
+	var validate = exports.validate = function validate (val, schema, simple) {
+		var errors;
+		simple = !!simple;
+		errors = doValidation(val, schema, val);
+		return simple ? !!errors.$counts.$total : errors;
+	};
 
 	/* this is where it all actually happens. A function which determines the
 	 * type of a value, determines whether it matches the type and whether it's

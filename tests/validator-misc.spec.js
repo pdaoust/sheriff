@@ -2,7 +2,7 @@
  * @author Paul d'Aoust
  */
 
-var is = require('is-helpers');
+var is = require('wrangler').is;
 var validator = require('../index');
 
 describe('validator-misc', function () {
